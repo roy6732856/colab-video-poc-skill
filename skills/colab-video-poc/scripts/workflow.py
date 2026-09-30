@@ -25,6 +25,7 @@ UPSTREAM_URL = "https://github.com/killkli/minimax-h3-colab-skill.git"
 UPSTREAM_COMMIT = "7768ebfb1627546595f37e9acfd2d353937c6cd8"
 NOTEBOOK_SHA256 = "ec80a3452f5ffc4ab4f675c66e849a0f802f4faa925ee79e30fb0f16d6005b8f"
 SCRIPT_DIR = Path(__file__).resolve().parent
+CACHE_MANIFEST = SCRIPT_DIR.parent / "assets/cache-manifest.json"
 STOP_TIMEOUT_SECONDS = 30
 STOP_ATTEMPTS = 2
 CLEANUP_RESERVE_SECONDS = 75  # Both stop attempts plus polling/scheduling margin.
@@ -204,8 +205,29 @@ def resolve_manifest(manifest: Path, output_dir: Path) -> list[dict[str, Any]]:
     return result
 
 
-def plan(manifest: Path, output_dir: Path, gpu: str = "G4", max_minutes: float = 45, max_units: float = 8) -> dict[str, Any]:
+def drive_cache_profile(root: str | None, gpu: str) -> dict[str, Any] | None:
+    if root is None:
+        return None
+    from pathlib import PurePosixPath
+    path = PurePosixPath(root)
+    mount = PurePosixPath("/content/drive/MyDrive")
+    if (not isinstance(root, str) or ".." in path.parts or "\\" in root
+            or "\x00" in root or not path.is_relative_to(mount) or path == mount):
+        raise ValueError("--drive-cache must be a directory below /content/drive/MyDrive")
+    if gpu != "G4":
+        raise ValueError("Drive cache profile supports only the tested G4 Ref2VA fp8_scaled branch")
+    import model_cache
+    payload = CACHE_MANIFEST.read_bytes()
+    profile = model_cache.validate_manifest(json.loads(payload))
+    return {"root": str(path), "profile_sha256": hashlib.sha256(payload).hexdigest(),
+            "repo_id": model_cache.REPO_ID, "revision": profile.revision,
+            "required_bytes": sum(f.bytes for f in profile.files), "variant": "fp8_scaled"}
+
+
+def plan(manifest: Path, output_dir: Path, gpu: str = "G4", max_minutes: float = 45, max_units: float = 8,
+         drive_cache: str | None = None) -> dict[str, Any]:
     max_minutes, max_units = positive(max_minutes, "max_minutes"), positive(max_units, "max_units")
+    cache_profile = drive_cache_profile(drive_cache, gpu)
     jobs = resolve_manifest(manifest.resolve(), output_dir.resolve())
     output_dir.mkdir(parents=True, exist_ok=True)
     inputs = {path for job in jobs for path in job["reference_images"]}
@@ -216,6 +238,8 @@ def plan(manifest: Path, output_dir: Path, gpu: str = "G4", max_minutes: float =
              "upstream_commit": UPSTREAM_COMMIT, "gpu": gpu,
              "max_minutes": max_minutes, "estimated_compute_unit_cap": max_units, "jobs": jobs,
              "allocates_gpu": False, "billing_scope": "Estimated runtime guard; provider settlement is not verified"}
+    if cache_profile is not None:
+        state["drive_cache"] = cache_profile
     save(output_dir / "resolved-jobs.json", {"jobs": jobs})
     state["resolved_manifest_sha256"] = hashlib.sha256((output_dir / "resolved-jobs.json").read_bytes()).hexdigest()
     save(output_dir / "plan.json", state)
@@ -251,13 +275,17 @@ def stream_log(pipe: Any, path: Path) -> None:
 
 def run_batch(manifest: Path, output_dir: Path, cli: Any, upstream: Path,
               gpu: str = "G4", high_mem: bool | None = None, max_minutes: float = 45,
-              max_units: float = 8, whisper_model: Path | None = None) -> dict[str, Any]:
+              max_units: float = 8, whisper_model: Path | None = None,
+              drive_cache: str | None = None) -> dict[str, Any]:
+    cache_profile = drive_cache_profile(drive_cache, gpu)
     if output_dir.exists() and any(output_dir.iterdir()):
         permitted = {"plan.json", "resolved-jobs.json"}
         if any(p.name not in permitted for p in output_dir.iterdir()):
             raise ValueError("Use a fresh output directory; prior run artifacts are never overwritten")
     existing = read_json(output_dir / "plan.json")
     if existing:
+        if existing.get("drive_cache") != cache_profile:
+            raise ValueError("Drive cache root/profile differs from the saved plan; review a new plan")
         # Keep seeds/normalized input from the reviewed plan, but revalidate files.
         if (existing.get("gpu"), existing.get("max_minutes"), existing.get("estimated_compute_unit_cap")) != (gpu, float(max_minutes), float(max_units)):
             raise ValueError("Run limits differ from the saved plan; review a new plan in a fresh folder")
@@ -272,6 +300,8 @@ def run_batch(manifest: Path, output_dir: Path, cli: Any, upstream: Path,
         spec = dict(existing)
         spec["jobs"] = resolve_manifest(reviewed.resolve(), output_dir.resolve())
     else:
+        if cache_profile is not None:
+            raise ValueError("Drive cache runs require a saved reviewed plan before allocation")
         spec = plan(manifest, output_dir, gpu, max_minutes, max_units)
     before = cli.usage()
     if before["active_assignments"]:
@@ -281,6 +311,8 @@ def run_batch(manifest: Path, output_dir: Path, cli: Any, upstream: Path,
     session = "h3poc-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     state: dict[str, Any] = {"status": "starting", "session": session, "started_at": now(), "usage_before": before,
                              "upstream_commit": UPSTREAM_COMMIT, "gpu": gpu, "results": [], "cleanup": {"confirmed": False}}
+    if cache_profile:
+        state["drive_cache"] = dict(cache_profile, persistence="unknown")
     save(output_dir / "result.json", state)
     allocation_attempted, proc, reader = False, None, None
     begun = time.monotonic()
@@ -312,6 +344,11 @@ def run_batch(manifest: Path, output_dir: Path, cli: Any, upstream: Path,
                    "--manifest", str((output_dir / "resolved-jobs.json").resolve()), "--session", session,
                    "--gpu", gpu, "--timeout", str(max(1, int(remaining - CLEANUP_RESERVE_SECONDS))),
                    "--progress", str((output_dir / "progress.json").resolve()), "--output-dir", str(output_dir.resolve())]
+        if cache_profile:
+            command = [sys.executable, "-u", str(SCRIPT_DIR / "cache_launcher.py"),
+                       "--upstream", str(upstream.resolve()), "--colab", cli.executable,
+                       "--auth", cli.auth, "--drive-cache", cache_profile["root"],
+                       "--profile-sha256", cache_profile["profile_sha256"], "--", *command]
         env = os.environ.copy()
         env.update(COLAB_AUTH=cli.auth, PYTHONUNBUFFERED="1", PYTHONDONTWRITEBYTECODE="1")
         env["PATH"] = str(Path(cli.executable).parent) + os.pathsep + env.get("PATH", "")
@@ -338,6 +375,10 @@ def run_batch(manifest: Path, output_dir: Path, cli: Any, upstream: Path,
             state["runner_returncode"] = proc.returncode
             if proc.returncode:
                 state["error"] = "Upstream batch failed; inspect the retained progress/log for completed jobs"
+            if cache_profile:
+                evidence = read_json(output_dir / "cache-report.json")
+                state["drive_cache"]["report"] = evidence
+                state["drive_cache"]["persistence"] = evidence.get("persistence", "unknown")
             # Download complete runtime logs before releasing the VM; evidence is optional.
             try:
                 runtime_log = output_dir / "comfyui.log"
@@ -387,6 +428,10 @@ def run_batch(manifest: Path, output_dir: Path, cli: Any, upstream: Path,
                 reader.join(timeout=5)
             if proc is not None and proc.stdout is not None:
                 proc.stdout.close()
+            if cache_profile:
+                evidence = read_json(output_dir / "cache-report.json")
+                state["drive_cache"]["report"] = evidence
+                state["drive_cache"]["persistence"] = evidence.get("persistence", "unknown")
             if stop_errors:
                 state["cleanup"]["stop_errors"] = stop_errors
             try:
@@ -461,6 +506,7 @@ def main() -> int:
         p.add_argument("--gpu", choices=["G4", "A100", "H100", "L4", "T4"], default="G4")
         p.add_argument("--max-minutes", type=float, default=45)
         p.add_argument("--max-units", type=float, default=8)
+        p.add_argument("--drive-cache", help="Opt-in remote revision cache below /content/drive/MyDrive (G4 only)")
         if name == "run":
             p.add_argument("--high-mem", action=argparse.BooleanOptionalAction, default=None)
             p.add_argument("--cache-dir", type=Path)
@@ -476,7 +522,7 @@ def main() -> int:
         elif args.command == "bootstrap":
             result = {"upstream_path": str(bootstrap(args.cache_dir)), "commit": UPSTREAM_COMMIT, "allocates_gpu": False}
         elif args.command == "plan":
-            result = plan(args.manifest, args.output_dir, args.gpu, args.max_minutes, args.max_units)
+            result = plan(args.manifest, args.output_dir, args.gpu, args.max_minutes, args.max_units, args.drive_cache)
         elif args.command == "run":
             check_oauth(args.auth)
             if any(not shutil.which(tool) for tool in ["git", "ffmpeg", "ffprobe"]):
@@ -484,7 +530,7 @@ def main() -> int:
             # Validate all jobs before fetching code or allocating resources.
             resolve_manifest(args.manifest.resolve(), args.output_dir.resolve())
             result = run_batch(args.manifest.resolve(), args.output_dir.resolve(), Colab(args.colab, args.auth), bootstrap(args.cache_dir),
-                               args.gpu, args.high_mem, args.max_minutes, args.max_units, args.whisper_model)
+                               args.gpu, args.high_mem, args.max_minutes, args.max_units, args.whisper_model, args.drive_cache)
         else:
             from verify_media import verify_media
             result = verify_media(args.video, args.output_dir, args.expected_dialogue, args.whisper_model,
