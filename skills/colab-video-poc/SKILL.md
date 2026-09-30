@@ -27,6 +27,12 @@ into a local cache; upstream code is not bundled or relicensed.
    Set the GPU and both limits to the user's agreed values in **both** plan and run.
    This checks every input and output collision before renting a GPU. Use a fresh
    run folder to preserve earlier results. Planning does not allocate a VM.
+5. Optional Drive model cache: read [references/model-cache.md](references/model-cache.md).
+   Add the identical `--drive-cache /content/drive/MyDrive/.../<revision>` to plan
+   and run. This requires a saved reviewed plan and supports only G4 Ref2VA
+   `fp8_scaled`; changed profile/root or unsupported variants stop the launch.
+   Live Drive persistence is unverified pending user consent. Official mount,
+   setup, staging and confirmed flush/unmount all consume the owned guard.
 
 ## Generate and finish
 
@@ -65,8 +71,10 @@ Leave final settlement unknown. Deliver earlier completed clips if a later job f
   Report `budget_guard.limit_exceeded` and keep provider settlement unverified.
 - This pipeline is Base/Turbo 768p with native audio; it does not implement the
   complete hosted 2K workflow. Larger VRAM does not establish the fastest GPU.
-- Skill reuse removes repeated setup decisions. Fresh VMs still need large
-  model downloads; the local code cache is not a persistent remote model cache.
+- Skill reuse removes repeated setup decisions. Default fresh VMs still download
+  large weights. Opt-in Drive cache verifies and stages the five pinned weights;
+  warm staging still incurs I/O and idle runtime charges. Consent failure does
+  not fall back to another download/authentication path.
 - Keep inputs, outputs, credentials and private logs outside the public package.
   For failure handling and the verified baseline, read
   [references/verification.md](references/verification.md).
