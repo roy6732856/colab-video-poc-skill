@@ -1,0 +1,54 @@
+# Python and local development
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.DS_Store
+
+# Private job inputs, local reports, generated media and model weights
+/jobs.json
+/jobs*.json
+/inputs/
+/outputs/
+/qa/
+/logs/
+*.log
+*.mp4
+*.mov
+*.webm
+*.mkv
+*.wav
+*.mp3
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+
+# Runtime upstream downloads belong outside this repository
+.cache/
+cache/
+caches/
+upstream/
+models/
+.colab-video-poc-install-*/
+.colab-video-poc-backups/
+
+# Credentials and session state must never enter the public package
+.env
+.env.*
+*.pem
+*.key
+*credentials*.json
+*oauth*.json
+*token*.json
+sessions.json
+.config/colab-cli/
+.colab-cli*/

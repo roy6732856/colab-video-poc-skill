@@ -1,0 +1,57 @@
+name: Offline checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.11', '3.12']
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install media verification tools
+        shell: bash
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            if [[ "$RUNNER_OS" == "Linux" ]]; then
+              sudo apt-get update -qq
+              sudo apt-get install -y ffmpeg
+            else
+              brew install ffmpeg
+            fi
+          fi
+          ffmpeg -version
+          ffprobe -version
+      - name: Check Python syntax without executing scripts
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          files = []
+          for directory in ('scripts', 'skills', 'tests'):
+              files.extend(Path(directory).rglob('*.py'))
+          for path in sorted(files):
+              ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+          print(f'Syntax checked: {len(files)} Python files')
+          PY
+      - name: Run standard-library unit tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v

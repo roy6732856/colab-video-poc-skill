@@ -1,0 +1,4 @@
+interface:
+  display_name: "Colab Video POC"
+  short_description: "Run bounded H3 video batches with media QA and GPU cleanup"
+  default_prompt: "Use $colab-video-poc to generate and verify a short reference-image video on Colab within my compute-unit budget."
