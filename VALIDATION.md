@@ -11,6 +11,10 @@ Checked 2026-09-30 on macOS with Python 3.14 and official Colab CLI 0.7.4.
   one-second retry under both unit and wall-time limits, explicit guard-overrun
   reporting, and H3 frame-aligned duration checks. Stop attempts get a 75-second
   reserve; provider release remains subject to external latency/failure.
+- An independent targeted retest confirmed both fixes: three stub scenarios,
+  six CLI commands and 20/20 assertions passed. Slow-cleanup estimates stayed
+  under the respective 3-unit and 20-minute guards; four-second outputs for
+  eight-second jobs produced duration mismatch, `needs_review` and CLI exit 1.
 - Source and installed skill passed the system skill-creator format validator.
   All seven installed skill files matched the source by SHA-256.
 - The installed CLI planned two clips with a 20-minute, estimated 3-unit cap
