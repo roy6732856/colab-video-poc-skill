@@ -2,10 +2,15 @@
 
 Checked 2026-09-30 on macOS with Python 3.14 and official Colab CLI 0.7.4.
 
-- **35 local tests passed:** 14 installer tests, 6 media verification tests and
-  15 orchestration tests. Media fixtures use real ffmpeg/ffprobe. Allocation,
+- **39 local tests passed:** 14 installer tests, 8 media verification tests and
+  17 orchestration tests. Media fixtures use real ffmpeg/ffprobe. Allocation,
   interruption, watchdog, partial completion and cleanup failures use a fake
   provider, with no live GPU allocation.
+- Independent forward-testing found a cleanup-reserve gap and acceptance of
+  wrong-duration output. Regressions now cover a 30-second stop timeout plus a
+  one-second retry under both unit and wall-time limits, explicit guard-overrun
+  reporting, and H3 frame-aligned duration checks. Stop attempts get a 75-second
+  reserve; provider release remains subject to external latency/failure.
 - Source and installed skill passed the system skill-creator format validator.
   All seven installed skill files matched the source by SHA-256.
 - The installed CLI planned two clips with a 20-minute, estimated 3-unit cap

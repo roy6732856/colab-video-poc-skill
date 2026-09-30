@@ -20,6 +20,15 @@ verify_media = media_module.verify_media
 
 
 class MediaPathTests(unittest.TestCase):
+    def test_h3_duration_accepts_alignment_and_rejects_short_output(self):
+        for requested, frames in ((4,107),(8,192),(15,362)):
+            with self.subTest(requested=requested):
+                stage = media_module._duration_requirement({"video_duration_seconds":frames/24},requested)
+                self.assertEqual(stage["status"],"passed")
+                self.assertEqual(stage["expected_aligned_frames"],frames)
+        stage = media_module._duration_requirement({"video_duration_seconds":4},8)
+        self.assertEqual(stage["status"],"mismatch")
+
     def test_source_and_output_errors_preserve_source(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -108,6 +117,14 @@ class MediaIntegrationTests(unittest.TestCase):
         self.assertEqual(report["media"]["audio_stream_count"], 0)
         self.assertFalse(report["stages"]["audio_signal"]["non_silent"])
         self.assertEqual(report["stages"]["decode"]["status"], "passed")
+
+    def test_valid_media_with_wrong_duration_is_not_accepted(self):
+        output = self.root / "wrong-duration-report"
+        report = verify_media(self.fixtures["signal"], output, expected_duration_seconds=8)
+        self.check_saved_report(output,report)
+        self.assertTrue(report["technical_passed"])
+        self.assertFalse(report["automated_passed"])
+        self.assertEqual(report["stages"]["duration"]["status"],"mismatch")
 
     def test_silent_audio_is_not_a_pass(self):
         output = self.root / "silent-report"

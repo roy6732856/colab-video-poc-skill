@@ -252,8 +252,26 @@ def _asr(tool: str | None, model: Path | None, expected: str | None,
             "scope": "recognized words only; no voice, accent, emotion or lip-sync acceptance"}
 
 
+def _duration_requirement(media: dict, requested: float | None) -> dict:
+    if requested is None:
+        return {"status": "skipped", "reason": "expected H3 duration not supplied"}
+    requested = float(requested)
+    if not math.isfinite(requested) or requested <= 0:
+        raise ValueError("expected_duration_seconds must be finite and positive")
+    requested_frames = max(5, round(requested * 24))
+    aligned_frames = requested_frames + (5 - requested_frames % 17) % 17
+    expected = aligned_frames / 24
+    observed = media.get("video_duration_seconds")
+    tolerance = 2 / 24
+    return {"status": "unavailable" if observed is None else "passed" if abs(observed - expected) <= tolerance else "mismatch",
+            "requested_seconds": requested, "expected_aligned_frames": aligned_frames,
+            "expected_aligned_seconds": expected, "observed_seconds": observed,
+            "tolerance_seconds": tolerance, "scope": "H3 24 fps / 17k+5 alignment, with two-frame timestamp tolerance"}
+
+
 def verify_media(video: Path, output_dir: Path, expected_dialogue: str | None = None,
-                 whisper_model: Path | None = None, *, ffmpeg_timeout: float = 180) -> dict:
+                 whisper_model: Path | None = None, *, ffmpeg_timeout: float = 180,
+                 expected_duration_seconds: float | None = None) -> dict:
     """Write verification.json and a contact sheet, returning the same report.
 
     Bad source/output paths raise OSError/ValueError. Media failures, unavailable
@@ -265,6 +283,7 @@ def verify_media(video: Path, output_dir: Path, expected_dialogue: str | None = 
     """
     if not math.isfinite(ffmpeg_timeout) or ffmpeg_timeout <= 0:
         raise ValueError("ffmpeg_timeout must be a finite positive number")
+    _duration_requirement({}, expected_duration_seconds)  # Validate before writing artifacts.
     video, output_dir = Path(video).expanduser().resolve(), Path(output_dir).expanduser().resolve()
     if not video.is_file():
         raise FileNotFoundError("video must be an existing regular file")
@@ -367,7 +386,8 @@ def verify_media(video: Path, output_dir: Path, expected_dialogue: str | None = 
         except _StageError as exc:
             stages["asr"] = exc.stage
     report["technical_passed"] = all(stages[name]["status"] == "passed" for name in _TECHNICAL_STAGES)
-    report["automated_passed"] = report["technical_passed"] and stages["asr"]["status"] in ("passed", "skipped")
+    stages["duration"] = _duration_requirement(media, expected_duration_seconds)
+    report["automated_passed"] = report["technical_passed"] and stages["asr"]["status"] in ("passed", "skipped") and stages["duration"]["status"] in ("passed", "skipped")
     report["status"] = ("candidate" if report["automated_passed"] else "failed"
                         if any(stage["status"] in ("failed", "mismatch") for stage in stages.values())
                         else "incomplete")
@@ -380,12 +400,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--video", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--expected-dialogue")
+    parser.add_argument("--expected-duration", type=float, help="requested H3 duration; check native frame alignment")
     parser.add_argument("--whisper-model", type=Path, help="existing local checkpoint FILE; no model names/downloads")
     parser.add_argument("--ffmpeg-timeout", type=float, default=180, help="timeout per external command in seconds")
     args = parser.parse_args(argv)
     try:
         report = verify_media(args.video, args.output_dir, args.expected_dialogue, args.whisper_model,
-                              ffmpeg_timeout=args.ffmpeg_timeout)
+                              ffmpeg_timeout=args.ffmpeg_timeout, expected_duration_seconds=args.expected_duration)
     except (OSError, ValueError) as exc:
         print(f"verification could not run: {exc}", file=sys.stderr)
         return 2

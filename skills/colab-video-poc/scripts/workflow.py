@@ -25,6 +25,9 @@ UPSTREAM_URL = "https://github.com/killkli/minimax-h3-colab-skill.git"
 UPSTREAM_COMMIT = "7768ebfb1627546595f37e9acfd2d353937c6cd8"
 NOTEBOOK_SHA256 = "ec80a3452f5ffc4ab4f675c66e849a0f802f4faa925ee79e30fb0f16d6005b8f"
 SCRIPT_DIR = Path(__file__).resolve().parent
+STOP_TIMEOUT_SECONDS = 30
+STOP_ATTEMPTS = 2
+CLEANUP_RESERVE_SECONDS = 75  # Both stop attempts plus polling/scheduling margin.
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
@@ -301,13 +304,13 @@ def run_batch(manifest: Path, output_dir: Path, cli: Any, upstream: Path,
         effective_limit = min(effective_limit, units / rate * 3600)
         state.update(status="running", usage_live=live, effective_wall_limit_seconds=effective_limit, effective_estimated_unit_cap=units)
         remaining = effective_limit - (time.monotonic() - begun)
-        if remaining <= 60:
+        if remaining <= CLEANUP_RESERVE_SECONDS + 1:
             raise RuntimeError("Insufficient remaining time inside the live-rate budget")
         save(output_dir / "result.json", state)
         # Upstream executes on our session; this adapter exclusively owns cleanup.
         command = [sys.executable, "-u", str(upstream / "scripts/runner.py"), "batch",
                    "--manifest", str((output_dir / "resolved-jobs.json").resolve()), "--session", session,
-                   "--gpu", gpu, "--timeout", str(max(1, int(remaining - 30))),
+                   "--gpu", gpu, "--timeout", str(max(1, int(remaining - CLEANUP_RESERVE_SECONDS))),
                    "--progress", str((output_dir / "progress.json").resolve()), "--output-dir", str(output_dir.resolve())]
         env = os.environ.copy()
         env.update(COLAB_AUTH=cli.auth, PYTHONUNBUFFERED="1", PYTHONDONTWRITEBYTECODE="1")
@@ -326,7 +329,7 @@ def run_batch(manifest: Path, output_dir: Path, cli: Any, upstream: Path,
                         seen.add(safe)
                         timeline.write(json.dumps({"observed_at": now(), "line": safe}, ensure_ascii=False) + "\n")
                         timeline.flush()
-                if time.monotonic() - begun >= effective_limit - 30:
+                if time.monotonic() - begun >= effective_limit - CLEANUP_RESERVE_SECONDS:
                     state["error"] = "Estimated compute-unit or wall-time limit reached; no automatic retry"
                     state["guard_stop"] = True
                     break
@@ -338,7 +341,10 @@ def run_batch(manifest: Path, output_dir: Path, cli: Any, upstream: Path,
             # Download complete runtime logs before releasing the VM; evidence is optional.
             try:
                 runtime_log = output_dir / "comfyui.log"
-                cli.call(["download", "--session", session, "/content/comfyui_h3.log", str(runtime_log.resolve())], 20)
+                evidence_time = min(20, effective_limit - (time.monotonic() - begun) - CLEANUP_RESERVE_SECONDS)
+                if evidence_time <= 0:
+                    raise RuntimeError("Skipped optional runtime evidence to preserve cleanup budget")
+                cli.call(["download", "--session", session, "/content/comfyui_h3.log", str(runtime_log.resolve())], evidence_time)
                 log_text = scrub(runtime_log.read_text(encoding="utf-8", errors="replace"))
                 runtime_log.write_text(log_text, encoding="utf-8")
                 state["comfyui_execution_seconds"] = [float(n) for n in re.findall(r"Prompt executed in ([\d.]+) seconds", log_text)]
@@ -356,21 +362,31 @@ def run_batch(manifest: Path, output_dir: Path, cli: Any, upstream: Path,
         try:
             stop_errors = []
             if allocation_attempted:
-                for _ in range(2):
+                for attempt in range(STOP_ATTEMPTS):
                     try:
-                        cli.call(["stop", "--session", session], 30)
+                        remaining_stop_time = effective_limit - (time.monotonic() - begun)
+                        # Release remains necessary even if provider latency already exceeded the guard.
+                        timeout = min(STOP_TIMEOUT_SECONDS, max(1, remaining_stop_time / (STOP_ATTEMPTS - attempt))) if remaining_stop_time > 0 else STOP_TIMEOUT_SECONDS
+                        cli.call(["stop", "--session", session], timeout)
                         state["cleanup"]["stop_command_succeeded"] = True
                         break
                     except Exception as exc:
                         stop_errors.append(scrub(str(exc)))
+            state["allocated_wall_seconds_estimate"] = round(time.monotonic() - begun, 3)
+            state["estimated_compute_units"] = round(state["allocated_wall_seconds_estimate"] * rate / 3600, 4) if rate else None
+            cap = min(float(spec["estimated_compute_unit_cap"]), float(before["balance"]))
+            exceeded = state["allocated_wall_seconds_estimate"] > effective_limit or (state["estimated_compute_units"] is not None and state["estimated_compute_units"] > cap)
+            state["budget_guard"] = {"wall_limit_seconds": effective_limit, "estimated_unit_cap": cap,
+                                     "cleanup_reserve_seconds": CLEANUP_RESERVE_SECONDS, "limit_exceeded": exceeded,
+                                     "estimate_scope": "Until owned stop attempts finished; an unconfirmed allocation may continue consuming units"}
+            if exceeded:
+                state["error"] = (state.get("error", "") + "; " if state.get("error") else "") + "Observed runtime estimate exceeded the agreed guard; release still attempted"
             if proc is not None:
                 terminate(proc)
             if reader is not None:
                 reader.join(timeout=5)
             if proc is not None and proc.stdout is not None:
                 proc.stdout.close()
-            state["allocated_wall_seconds_estimate"] = round(time.monotonic() - begun, 3)
-            state["estimated_compute_units"] = round(state["allocated_wall_seconds_estimate"] * rate / 3600, 4) if rate else None
             if stop_errors:
                 state["cleanup"]["stop_errors"] = stop_errors
             try:
@@ -400,7 +416,8 @@ def run_batch(manifest: Path, output_dir: Path, cli: Any, upstream: Path,
         item = {"id": job["id"], "output_path": str(path), "status": "downloaded"}
         try:
             from verify_media import verify_media
-            item["verification"] = verify_media(path, output_dir / "qa" / job["id"], job.get("expected_dialogue"), whisper_model)
+            item["verification"] = verify_media(path, output_dir / "qa" / job["id"], job.get("expected_dialogue"), whisper_model,
+                                                 expected_duration_seconds=job["duration_seconds"])
             qa = item["verification"]
             item["status"] = "verified" if qa.get("automated_passed") else "needs_review" if qa.get("technical_passed") else "verification_failed"
         except Exception as exc:
@@ -451,6 +468,7 @@ def main() -> int:
     v = sub.add_parser("verify")
     v.add_argument("--video", type=Path, required=True); v.add_argument("--output-dir", type=Path, required=True)
     v.add_argument("--expected-dialogue"); v.add_argument("--whisper-model", type=Path)
+    v.add_argument("--expected-duration", type=float, help="requested H3 duration; check native frame alignment")
     args = parser.parse_args()
     try:
         if args.command == "doctor":
@@ -469,7 +487,8 @@ def main() -> int:
                                args.gpu, args.high_mem, args.max_minutes, args.max_units, args.whisper_model)
         else:
             from verify_media import verify_media
-            result = verify_media(args.video, args.output_dir, args.expected_dialogue, args.whisper_model)
+            result = verify_media(args.video, args.output_dir, args.expected_dialogue, args.whisper_model,
+                                  expected_duration_seconds=args.expected_duration)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         if "automated_passed" in result:
             return 0 if result["automated_passed"] else 1

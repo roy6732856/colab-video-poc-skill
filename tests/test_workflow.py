@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import types
 import sys
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -60,7 +61,7 @@ class WorkflowTests(unittest.TestCase):
         self.upstream = self.root / "upstream"
         (self.upstream / "scripts").mkdir(parents=True)
         self.write_jobs(1)
-        self.verifier = patch.dict(sys.modules, {"verify_media": types.SimpleNamespace(verify_media=lambda *args: {"technical_passed": True, "automated_passed": True})})
+        self.verifier = patch.dict(sys.modules, {"verify_media": types.SimpleNamespace(verify_media=lambda *args, **kwargs: {"technical_passed": True, "automated_passed": True})})
         self.verifier.start()
 
     def tearDown(self):
@@ -188,6 +189,52 @@ Path(a.progress).write_text(json.dumps({'status':'completed','log_tail':['test r
         self.assertIn(result["session"],result["cleanup"]["recovery_command"])
         self.assertTrue((self.output/"clip-0.mp4").is_file())
 
+    def test_cleanup_retry_stays_inside_unit_and_wall_guards(self):
+        for rate in (18, 8.9):
+            with self.subTest(rate=rate):
+                self.output = self.root / f"retry-{rate}"
+                self.write_runner("wait")
+                clock = [0.0]
+                original_sleep = workflow.time.sleep
+                def sleep(seconds):
+                    clock[0] += seconds
+                    original_sleep(0.001)
+                class DelayedColab(FakeColab):
+                    attempts = 0
+                    def usage(self):
+                        data = super().usage()
+                        data["rate_per_hour"] = rate if self.active else 0
+                        return data
+                    def call(self, args, timeout=30):
+                        if args[0] == "stop":
+                            self.attempts += 1
+                            if self.attempts == 1:
+                                clock[0] += timeout
+                                raise subprocess.TimeoutExpired("colab stop", timeout)
+                            clock[0] += 1
+                        return super().call(args, timeout)
+                with patch.object(workflow.time,"monotonic",side_effect=lambda:clock[0]), patch.object(workflow.time,"sleep",side_effect=sleep):
+                    cli = DelayedColab()
+                    result = self.run_fake(cli, max_minutes=20, max_units=3)
+                self.assertEqual(cli.attempts,2)
+                self.assertTrue(result["cleanup"]["confirmed"])
+                self.assertFalse(result["budget_guard"]["limit_exceeded"])
+                self.assertLessEqual(result["allocated_wall_seconds_estimate"],1200)
+                self.assertLessEqual(result["estimated_compute_units"],3)
+
+    def test_provider_latency_overrun_is_visible(self):
+        clock = [0.0]
+        class SlowAllocation(FakeColab):
+            def call(self, args, timeout=30):
+                if args[0] == "new":
+                    clock[0] += 1250
+                return super().call(args, timeout)
+        with patch.object(workflow.time,"monotonic",side_effect=lambda:clock[0]):
+            result=self.run_fake(SlowAllocation(), max_minutes=20, max_units=3)
+        self.assertTrue(result["budget_guard"]["limit_exceeded"])
+        self.assertTrue(result["cleanup"]["confirmed"])
+        self.assertNotEqual(result["status"],"completed")
+
     def test_existing_allocation_is_not_stopped(self):
         cli=FakeColab(preexisting=True)
         with self.assertRaises(RuntimeError):self.run_fake(cli)
@@ -196,14 +243,14 @@ Path(a.progress).write_text(json.dumps({'status':'completed','log_tail':['test r
 
     def test_failed_media_stage_cannot_be_reported_as_verified(self):
         self.write_runner()
-        with patch.dict(sys.modules, {"verify_media": types.SimpleNamespace(verify_media=lambda *a: {"technical_passed": False, "automated_passed": False})}):
+        with patch.dict(sys.modules, {"verify_media": types.SimpleNamespace(verify_media=lambda *a, **kw: {"technical_passed": False, "automated_passed": False})}):
             result=self.run_fake(FakeColab())
         self.assertEqual(result["status"],"needs_review")
         self.assertEqual(result["results"][0]["status"],"verification_failed")
 
     def test_speech_mismatch_requires_review(self):
         self.write_runner()
-        with patch.dict(sys.modules, {"verify_media": types.SimpleNamespace(verify_media=lambda *a: {"technical_passed": True, "automated_passed": False, "stages": {"asr": {"status": "mismatch", "match": False}}})}):
+        with patch.dict(sys.modules, {"verify_media": types.SimpleNamespace(verify_media=lambda *a, **kw: {"technical_passed": True, "automated_passed": False, "stages": {"asr": {"status": "mismatch", "match": False}}})}):
             result=self.run_fake(FakeColab())
         self.assertEqual(result["status"],"needs_review")
 

@@ -48,6 +48,7 @@ temporal contact sheet. For dialogue, use an existing local Whisper checkpoint
 when available (`--whisper-model /absolute/small.pt`); otherwise report speech
 content as unverified. ASR does not accept accent, emotion, naturalness or precise
 lip sync. Missing/silent audio, decode failure and speech mismatches remain visible.
+Each clip's measured duration is checked against H3's native frame-aligned target.
 
 Report output paths, observed content, resolution/duration, preparation and
 execution times, displayed balance change, time-times-rate estimate and cleanup.
@@ -60,6 +61,8 @@ Leave final settlement unknown. Deliver earlier completed clips if a later job f
   failure; never silently switch providers or retry a timed-out kernel.
 - Ctrl+C and watchdog cleanup stop only the owned runtime. If release cannot be
   confirmed, report its name and stop command instead of claiming zero consumption.
+  The guard reserves 75 seconds for cleanup; provider latency can still exceed it.
+  Report `budget_guard.limit_exceeded` and keep provider settlement unverified.
 - This pipeline is Base/Turbo 768p with native audio; it does not implement the
   complete hosted 2K workflow. Larger VRAM does not establish the fastest GPU.
 - Skill reuse removes repeated setup decisions. Fresh VMs still need large

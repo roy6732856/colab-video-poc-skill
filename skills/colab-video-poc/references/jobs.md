@@ -52,6 +52,8 @@ configuration needs its own verification.
 Frames align to `17k+5` at 24 fps. Eight seconds gives exactly 192 frames; four
 gives 107 (4.458 seconds), fifteen gives 362 (15.083 seconds). Accepted duration
 is not a frame-accurate guarantee. Prompted cuts are semantic instructions.
+QA checks the measured duration against that aligned target, allowing two frames
+of timestamp tolerance. A substantially shorter or longer output needs review.
 
 For optional local speech QA, set `expected_dialogue` and pass `--whisper-model`
 with an existing checkpoint FILE. No ASR model is downloaded automatically.
